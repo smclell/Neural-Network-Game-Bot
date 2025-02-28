@@ -10,6 +10,8 @@ import torch.nn.functional as F
 import torch.nn as nn
 import torch.nn.utils as torch_utils
 import torchvision.transforms as transforms
+from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 import gymnasium as gym
 from collections import deque
 from PIL import Image
@@ -22,10 +24,10 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"{device}")
 
-path = 'Parallization-testing'
+path = 'para-data-loader-testing'
 
 ########################################################################
-run_num = 7 #update this every run
+run_num = 8 #update this every run
 ########################################################################
 
 class DQNBreakout(gym.Wrapper):
@@ -153,6 +155,24 @@ class AtariNet(nn.Module):
         except:
             print(f"No weights file available at {weights_filename}")    
 
+class CustomDataset(Dataset):
+    def __init__(self, device, num_samples=1000):
+        self.device = device
+        self.num_samples = num_samples
+        self.env = DQNBreakout(device=device, render_mode='rgb_array')
+    
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        state = self.env.reset()
+        done = False
+        while not done:
+            action = self.env.action_space.sample()  # Random action for demonstration
+            next_state, reward, done, _ = self.env.step(action)
+            yield state, action, reward, done, next_state
+            state = next_state
+
 class ReplayMemory:
     def __init__(self, capacity, device='cpu'):
         self.capacity = capacity
@@ -236,75 +256,39 @@ class Agent:
             av = self.model(state).detach()
             return torch.argmax(av, dim=1, keepdim=True)
 
-    def train(self, env, epochs, progress_bar=None):
-        stats = {'Returns' : [], 'AvgReturns' : [], 'EpsilonCheckpoint' : []}
+    def train(self, states, actions, rewards, dones, next_states):
+        # Convert batched data to tensors
+        states = torch.stack(states)
+        actions = torch.stack(actions)
+        rewards = torch.stack(rewards)
+        dones = torch.stack(dones)
+        next_states = torch.stack(next_states)
 
-        # plotter = LivePlot()
+        # Get Q-values for current states
+        q_values = self.model(states)
 
-        for epoch in range(1, epochs + 1):
-            state = env.reset()
-            done = False
-            ep_return = 0
-        
+        # Get Q-values for next states using the target network
+        next_q_values = self.target_model(next_states).detach()
+        max_next_q_values = torch.max(next_q_values, dim=-1, keepdim=True)[0]
 
-            while not done:
-                action = self.get_action(state)
+        # Compute target Q-values
+        target_q_values = rewards + ~dones * self.gamma * max_next_q_values
 
-                next_state, reward, done, info = env.step(action)
+        # Gather the Q-values for the actions taken
+        q_values_for_actions = q_values.gather(1, actions)
 
-                self.memory.insert([state, action, reward, done, next_state])
+        # Compute the loss using mean squared error
+        loss = F.mse_loss(q_values_for_actions, target_q_values)
 
-                if self.memory.can_sample(self.batch_size):
-                    state_b, action_b, reward_b, done_b, next_state_b = self.memory.sample(self.batch_size)
+        # Optimize the model
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
-                    qsa_b = self.model(state_b).gather(1, action_b)
+        # Calculate returns for the current batch
+        batch_return = rewards.sum().item()
 
-                    next_qsa_b = self.target_model(next_state_b)
-                    next_qsa_b = torch.max(next_qsa_b, dim=-1, keepdim=True)[0]
-                    target_b = reward_b + ~done_b * self.gamma * next_qsa_b
-
-                    loss = F.mse_loss(qsa_b, target_b).to(device)
-                    self.model.zero_grad()
-                    loss.backward()
-                    torch_utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.optimizer.step()
-
-                state = next_state
-                ep_return += reward.item()
-
-            
-            stats['Returns'].append(ep_return)
-
-
-            if self.epsilon > self.min_epsilon:
-                self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
-            
-            if epoch % 10 == 0:
-                self.model.save_the_model(run_num=run_num)
-
-                average_returns = np.mean(stats['Returns'][-100:])
-
-                stats['AvgReturns'].append(average_returns)
-                stats['EpsilonCheckpoint'].append(self.epsilon)
-
-                # if (len(stats['Returns'])) > 100:
-                #     print(f"Epoch: {epoch} - Average Return: {np.mean(stats['Returns'][-100:])} - Epsilon: {self.epsilon}")
-                # else:
-                #     print(f"Epoch: {epoch} - Episode Return: {np.mean(stats['Returns'][-100:])} - Epsilon: {self.epsilon}")
-            
-            if epoch % 100 == 0:
-                self.target_model.load_state_dict(self.model.state_dict())
-
-            if epoch % 1000 == 0:
-                #plotter.update_plot(stats, run_num)
-                self.model.save_the_model(run_num, f"{path}/models/run-{run_num}/model_iter_{epoch}.pt")
-
-            if progress_bar is not None:
-                progress_bar.update(1)
-                average_returns = np.mean(stats['Returns'][-100:])
-                progress_bar.set_postfix(Epoch=epoch, Average_Returns=average_returns)
-            
-        return stats
+        return batch_return  # Return the total return for the batch
     
     def test(self, env):
         for epoch in range(1, 3):
@@ -317,17 +301,49 @@ class Agent:
                 state, reward, done, info = env.step(action)
                 if done:
                     break
-    
-import multiprocessing
-
-def worker(agent, env, start_epoch, end_epoch, progress_queue):
-    # Perform training for the specified range of epochs
-    for epoch in range(start_epoch, end_epoch + 1):
-        stats = agent.train(env=env, epochs=1)  # Train for one epoch
-        stats['Epoch'] = epoch
-        progress_queue.put(stats)  # Put the training statistics into the shared queue
 
 num_epochs = 9000
+
+def worker(agent, env, data_loader, epochs_per_process, process_index):
+    start_epoch = process_index * epochs_per_process
+    end_epoch = min((process_index + 1) * epochs_per_process, num_epochs)
+
+    stats = {'Returns': [], 'AvgReturns': [], 'EpsilonCheckpoint': []}
+
+    for epoch in range(start_epoch, end_epoch):
+        epoch_return = 0  # Accumulate returns across batches
+
+        for batch in data_loader:
+            states, actions, rewards, dones, next_states = batch
+
+            # Train the agent on the current batch and get the total return
+            total_return = agent.train(states, actions, rewards, dones, next_states)
+
+            # Accumulate returns
+            epoch_return += total_return
+
+        # Calculate average return for the epoch
+        average_return = epoch_return / len(data_loader)
+
+        # Update epsilon
+        if agent.epsilon > agent.min_epsilon:
+            agent.epsilon = max(agent.min_epsilon, agent.epsilon * agent.epsilon_decay)
+        stats['EpsilonCheckpoint'].append(agent.epsilon)
+
+        # Update average returns for display
+        stats['AvgReturns'].append(average_return)
+
+        # Update process_stats with the current stats
+        process_stats[process_index] = stats.copy()
+
+    # Return the final stats
+    return stats
+
+       
+
+########################################################################
+#    UPDATE THIS TO RUN AS ONLY ONE ENVIRONMENT TO SEE HOW IT GOES     #
+########################################################################
 
 if __name__ == '__main__':
     # Define the number of worker processes
@@ -336,49 +352,68 @@ if __name__ == '__main__':
     # Divide epochs among processes
     epochs_per_process = num_epochs // num_processes
 
-    # Create DQN environment and agent
-    env = DQNBreakout(device=device, render_mode='rgb_array')
-    model = AtariNet(nb_actions=4).to(device)
-    agent = Agent(model=model, device=device, epsilon=1.0, nb_warmup=5000, nb_actions=4, learning_rate=0.0001, memory_capacity=100000, batch_size=32)
+    # Create a custom dataset
+    dataset = CustomDataset(device=device, num_samples=1000)
+    
+    # Create a DataLoader for your dataset
+    data_loader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-    # Create a shared queue for progress updates
-    progress_queue = multiprocessing.Queue()
+    progress_bars = []
+    process_stats = [None] * num_processes
 
     # Spawn worker processes
     processes = []
     for i in range(num_processes):
-        start_epoch = i * epochs_per_process + 1
-        end_epoch = (i + 1) * epochs_per_process if i < num_processes - 1 else num_epochs
-        p = multiprocessing.Process(target=worker, args=(agent, env, start_epoch, end_epoch, progress_queue))
+        # Create DQN environment and agent
+        env = DQNBreakout(device=device, render_mode='rgb_array')
+        model = AtariNet(nb_actions=4).to(device)
+        agent = Agent(model=model, device=device, epsilon=1.0, nb_warmup=5000, nb_actions=4, learning_rate=0.0001, memory_capacity=100000, batch_size=32)
+
+        progress_bar = tqdm(total=epochs_per_process, desc=f"Process {i+1} Progress")
+        progress_bars.append(progress_bar)
+
+        process_stats.append({'Returns': [], 'AvgReturns': [], 'EpsilonCheckpoint': []})
+
+        p = Process(target=worker, args=(agent, env, data_loader, epochs_per_process, i, process_stats))
         p.start()
         processes.append(p)
-        
+
+    # pid = 0
+    # for p in processes:
+    #     pid += 1
+    #     if (p.is_alive()):
+    #         print(f"Process {pid} is running")
 
     average_reward = 0
     # Initialize progress bar
-    with tqdm(total=num_epochs, desc="Training Progress") as pbar:
+    with tqdm(total=num_epochs, desc="Training Progress") as overall_pbar:
         # Count the number of updates received from each process
         updates_received = [0] * num_processes
 
         while any(p.is_alive() for p in processes):
             # Check for progress updates from worker processes
-            while not progress_queue.empty():
-                stats = progress_queue.get()
-                epoch = stats['Epoch']  # Extract the epoch from the statistics
-                process_index = (epoch - 1) // epochs_per_process  # Determine the index of the process
+            for i, p in enumerate(processes):
+                p.join(timeout=0.1)
+                if not p.is_alive():
+                    # Update progress bar based on the epoch and process index
+                    progress_bars[i].update(epochs_per_process)
+                    
+                    # Get the stats returned by the process
+                    stats = process_stats[i]
+                    # Calculate the average return over the last few epochs
+                    avg_return = np.mean(stats['AvgReturns'][-10:])  # Adjust window size as needed
+                    # Update the progress bar with the average return as postfix
+                    progress_bars[i].set_postfix(Average_Return=avg_return)
 
-                # Update progress bar based on the epoch and process index
-                average_reward = np.mean(stats['Returns'][-100:])
-                pbar.update(1)
-                pbar.set_postfix(Average_Reward=average_reward)
-                
-                updates_received[process_index] += 1
+                    # Update the overall progress bar
+                    overall_pbar.update(epochs_per_process)
+                    sum_updates = sum(updates_received)
+                    overall_pbar.set_postfix(Updates=sum_updates)
+
+                    updates_received[i] += epochs_per_process
 
             # Sleep briefly to avoid excessive CPU usage
             time.sleep(0.1)
-
-            # Optionally, print updates received from each process
-            # print(f"Updates received from each process: {updates_received}")
 
     # Wait for all processes to finish
     for p in processes:
