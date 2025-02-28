@@ -21,10 +21,10 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"{device}")
 
-path = 'breakout-singlefile-dqn-large'
+path = 'breakout-singlefile-dqn'
 
 ########################################################################
-run_num = 6 #update this every run
+run_num = 10 #update this every run
 ########################################################################
 
 class DQNBreakout(gym.Wrapper):
@@ -46,6 +46,7 @@ class DQNBreakout(gym.Wrapper):
         ])
 
         self.device = device
+        self.observation = None
 
     def step(self, action):
         total_reward = 0
@@ -87,26 +88,17 @@ class DQNBreakout(gym.Wrapper):
 
         self.lives = self.env.unwrapped.ale.lives()
 
-        obs = self.process_obs(obs)
+        self.observation = self.process_obs(obs)
 
-        return obs
+        return self.observation
 
     def process_obs(self, obs):
+        if self.observation is None:
+            self.observation = self.transform(obs).unsqueeze(0).to(self.device)
+        else:
+            self.observation = self.transform(obs).unsqueeze(0).to(self.device)
 
-        # ing = Image.fromarray(obs)
-        # ing = ing.resize(self.image_shape)
-        # ing = ing.convert("L")
-        # ing = np.array(ing)
-        # ing = torch.from_numpy(ing)
-        # ing = ing.unsqueeze(0)
-        # ing = ing.unsqueeze(0)
-        # ing = ing / 255.0
-
-        # ing = ing.to(self.device)
-
-        ing = self.transform(obs).unsqueeze(0).to(self.device)
-
-        return ing
+        return self.observation
 
 class AtariNet(nn.Module):
     def __init__(self, nb_actions=4):
@@ -115,14 +107,14 @@ class AtariNet(nn.Module):
 
         self.relu = nn.ReLU()
 
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=(8, 8), stride=(4, 4))
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=(4, 4), stride=(2, 2))
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1))
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=(8, 8), stride=(4, 4)).to(device)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=(4, 4), stride=(2, 2)).to(device)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1)).to(device)
 
-        self.dropout = nn.Dropout(p=0.2)
+        self.dropout = nn.Dropout(p=0.2).to(device)
 
-        self.fc1 = nn.Linear(7 * 7 * 64, 512)
-        self.fc2 = nn.Linear(512, nb_actions)
+        self.fc1 = nn.Linear(7 * 7 * 64, 512).to(device)
+        self.fc2 = nn.Linear(512, nb_actions).to(device)
 
 
     def forward(self, x):
@@ -215,14 +207,13 @@ class Agent:
     def __init__(self, model, device='cpu', epsilon=1.0, min_epsilon=0.1, nb_warmup=10000, nb_actions=None, memory_capacity=10000,
                  batch_size=32, learning_rate=0.00025):
         self.memory = ReplayMemory(device=device, capacity=memory_capacity)
-        self.model = model
-        self.target_model = copy.deepcopy(model).eval()
+        self.model = model.to(device)
+        self.target_model = copy.deepcopy(model).eval().to(device)
         self.epsilon = epsilon
         self.min_epsilon = min_epsilon
         self.epsilon_decay = 1 - (((epsilon - min_epsilon) / nb_warmup) * 2)
         self.batch_size = batch_size
-        self.model.to(device)
-        self.target_model.to(device)
+        self.device = device
         self.gamma = 0.99
         self.nb_actions = nb_actions
 
@@ -232,16 +223,19 @@ class Agent:
         print(f"Epsilon decay is {self.epsilon_decay}")
 
     def get_action(self, state):
-        if torch.rand(1) < self.epsilon:
-            return torch.randint(self.nb_actions, (1, 1))
+        if torch.rand(1).to(self.device) < self.epsilon:
+            return torch.randint(self.nb_actions, (1, 1)).to(self.device)
         else:
-            av = self.model(state).detach()
-            return torch.argmax(av, dim=1, keepdim=True)
+            with torch.no_grad():
+                av = self.model(state)
+                return torch.argmax(av, dim=1, keepdim=True).to(self.device)
 
     def train(self, env, epochs, progress_bar=None):
         stats = {'Returns' : [], 'AvgReturns' : [], 'EpsilonCheckpoint' : []}
 
         plotter = LivePlot()
+
+        average_returns = 0
 
         for epoch in range(1, epochs + 1):
             state = env.reset()
@@ -261,12 +255,13 @@ class Agent:
 
                     qsa_b = self.model(state_b).gather(1, action_b)
 
-                    next_qsa_b = self.target_model(next_state_b)
-                    next_qsa_b = torch.max(next_qsa_b, dim=-1, keepdim=True)[0]
-                    target_b = reward_b + ~done_b * self.gamma * next_qsa_b
+                    with torch.no_grad():
+                        next_qsa_b = self.target_model(next_state_b)
+                        next_qsa_b = torch.max(next_qsa_b, dim=-1, keepdim=True)[0]
+                        target_b = reward_b + ~done_b * self.gamma * next_qsa_b
 
-                    loss = F.mse_loss(qsa_b, target_b)
-                    self.model.zero_grad()
+                    loss = F.smooth_l1_loss(qsa_b, target_b)
+                    self.optimizer.zero_grad()
                     loss.backward()
                     torch_utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
@@ -293,11 +288,9 @@ class Agent:
                 #     print(f"Epoch: {epoch} - Average Return: {np.mean(stats['Returns'][-100:])} - Epsilon: {self.epsilon}")
                 # else:
                 #     print(f"Epoch: {epoch} - Episode Return: {np.mean(stats['Returns'][-100:])} - Epsilon: {self.epsilon}")
-            
-            if epoch % 100 == 0:
-                self.target_model.load_state_dict(self.model.state_dict())
 
             if epoch % 1000 == 0:
+                self.target_model.load_state_dict(self.model.state_dict())
                 plotter.update_plot(stats, run_num)
                 self.model.save_the_model(run_num, f"{path}/models/run-{run_num}/model_iter_{epoch}.pt")
 
@@ -305,7 +298,7 @@ class Agent:
                 progress_bar.update(1)
                 average_returns = np.mean(stats['Returns'][-100:])
                 progress_bar.set_postfix(Epoch=epoch, Average_Returns=average_returns)
-            
+
         return stats
     
     def test(self, env):
@@ -322,20 +315,22 @@ class Agent:
 
 num_epochs = 9000
 
-env = DQNBreakout(device=device, render_mode='rgb_array')
+env = DQNBreakout(device=device, render_mode='human')
 
 model = AtariNet(nb_actions=4).to(device)
 
-model.load_the_model(run_num) #weights_filename='models\model_iter_5000.pt'
+model.load_the_model(run_num= 6, weights_filename=f"{path}/models/run-10/latest.pt") #weights_filename='models\model_iter_5000.pt'
 
 agent = Agent(model=model,
               device=device,
               epsilon=1.0,
               nb_warmup=5000,
               nb_actions=4,
-              learning_rate=0.0001,
+              learning_rate=0.005,
               memory_capacity=100000,
-              batch_size=32)
+              batch_size=64)
 
-with tqdm(total=num_epochs, desc="Training Progress") as pbar:
-    agent.train(env=env, epochs=num_epochs, progress_bar=pbar)
+# with tqdm(total=num_epochs, desc="Training Progress") as pbar:
+#     agent.train(env=env, epochs=num_epochs, progress_bar=pbar)
+
+agent.test(env=env)
