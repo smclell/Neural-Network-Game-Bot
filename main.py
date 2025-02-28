@@ -15,16 +15,17 @@ from collections import deque
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
+from multiprocessing import Process, Queue
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"{device}")
 
-path = 'breakout-singlefile-dqn-large'
+path = 'Parallization-testing'
 
 ########################################################################
-run_num = 6 #update this every run
+run_num = 7 #update this every run
 ########################################################################
 
 class DQNBreakout(gym.Wrapper):
@@ -53,6 +54,7 @@ class DQNBreakout(gym.Wrapper):
 
         for i in range(self.repeat):
             observation, reward, terminated, truncated, info = self.env.step(action)
+
 
             total_reward += reward
 
@@ -211,9 +213,8 @@ class LivePlot():
         self.fig.savefig(f'{path}/plots/run-{run_num}/plot_iter_{self.epochs * 10}.png')
 
 class Agent:
-    
-    def __init__(self, model, device='cpu', epsilon=1.0, min_epsilon=0.1, nb_warmup=10000, nb_actions=None, memory_capacity=10000,
-                 batch_size=32, learning_rate=0.00025):
+    def __init__(self, model, device='cpu', epsilon=1.0, min_epsilon=0.1, nb_warmup=10000, nb_actions=None,
+                 memory_capacity=10000, batch_size=32, learning_rate=0.00025):
         self.memory = ReplayMemory(device=device, capacity=memory_capacity)
         self.model = model
         self.target_model = copy.deepcopy(model).eval()
@@ -228,9 +229,6 @@ class Agent:
 
         self.optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-        print(f"Starting epsilon is {self.epsilon}")
-        print(f"Epsilon decay is {self.epsilon_decay}")
-
     def get_action(self, state):
         if torch.rand(1) < self.epsilon:
             return torch.randint(self.nb_actions, (1, 1))
@@ -241,7 +239,7 @@ class Agent:
     def train(self, env, epochs, progress_bar=None):
         stats = {'Returns' : [], 'AvgReturns' : [], 'EpsilonCheckpoint' : []}
 
-        plotter = LivePlot()
+        # plotter = LivePlot()
 
         for epoch in range(1, epochs + 1):
             state = env.reset()
@@ -265,7 +263,7 @@ class Agent:
                     next_qsa_b = torch.max(next_qsa_b, dim=-1, keepdim=True)[0]
                     target_b = reward_b + ~done_b * self.gamma * next_qsa_b
 
-                    loss = F.mse_loss(qsa_b, target_b)
+                    loss = F.mse_loss(qsa_b, target_b).to(device)
                     self.model.zero_grad()
                     loss.backward()
                     torch_utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -298,7 +296,7 @@ class Agent:
                 self.target_model.load_state_dict(self.model.state_dict())
 
             if epoch % 1000 == 0:
-                plotter.update_plot(stats, run_num)
+                #plotter.update_plot(stats, run_num)
                 self.model.save_the_model(run_num, f"{path}/models/run-{run_num}/model_iter_{epoch}.pt")
 
             if progress_bar is not None:
@@ -319,23 +317,91 @@ class Agent:
                 state, reward, done, info = env.step(action)
                 if done:
                     break
+    
+import multiprocessing
+
+def worker(agent, env, start_epoch, end_epoch, progress_queue):
+    # Perform training for the specified range of epochs
+    for epoch in range(start_epoch, end_epoch + 1):
+        stats = agent.train(env=env, epochs=1)  # Train for one epoch
+        stats['Epoch'] = epoch
+        progress_queue.put(stats)  # Put the training statistics into the shared queue
 
 num_epochs = 9000
 
-env = DQNBreakout(device=device, render_mode='rgb_array')
+if __name__ == '__main__':
+    # Define the number of worker processes
+    num_processes = 4
 
-model = AtariNet(nb_actions=4).to(device)
+    # Divide epochs among processes
+    epochs_per_process = num_epochs // num_processes
 
-model.load_the_model(run_num) #weights_filename='models\model_iter_5000.pt'
+    # Create DQN environment and agent
+    env = DQNBreakout(device=device, render_mode='rgb_array')
+    model = AtariNet(nb_actions=4).to(device)
+    agent = Agent(model=model, device=device, epsilon=1.0, nb_warmup=5000, nb_actions=4, learning_rate=0.0001, memory_capacity=100000, batch_size=32)
 
-agent = Agent(model=model,
-              device=device,
-              epsilon=1.0,
-              nb_warmup=5000,
-              nb_actions=4,
-              learning_rate=0.0001,
-              memory_capacity=100000,
-              batch_size=32)
+    # Create a shared queue for progress updates
+    progress_queue = multiprocessing.Queue()
 
-with tqdm(total=num_epochs, desc="Training Progress") as pbar:
-    agent.train(env=env, epochs=num_epochs, progress_bar=pbar)
+    # Spawn worker processes
+    processes = []
+    for i in range(num_processes):
+        start_epoch = i * epochs_per_process + 1
+        end_epoch = (i + 1) * epochs_per_process if i < num_processes - 1 else num_epochs
+        p = multiprocessing.Process(target=worker, args=(agent, env, start_epoch, end_epoch, progress_queue))
+        p.start()
+        processes.append(p)
+        
+
+    average_reward = 0
+    # Initialize progress bar
+    with tqdm(total=num_epochs, desc="Training Progress") as pbar:
+        # Count the number of updates received from each process
+        updates_received = [0] * num_processes
+
+        while any(p.is_alive() for p in processes):
+            # Check for progress updates from worker processes
+            while not progress_queue.empty():
+                stats = progress_queue.get()
+                epoch = stats['Epoch']  # Extract the epoch from the statistics
+                process_index = (epoch - 1) // epochs_per_process  # Determine the index of the process
+
+                # Update progress bar based on the epoch and process index
+                average_reward = np.mean(stats['Returns'][-100:])
+                pbar.update(1)
+                pbar.set_postfix(Average_Reward=average_reward)
+                
+                updates_received[process_index] += 1
+
+            # Sleep briefly to avoid excessive CPU usage
+            time.sleep(0.1)
+
+            # Optionally, print updates received from each process
+            # print(f"Updates received from each process: {updates_received}")
+
+    # Wait for all processes to finish
+    for p in processes:
+        p.join()
+
+    print("All processes finished.")
+
+# 
+
+# env = DQNBreakout(device=device, render_mode='rgb_array')
+
+# model = AtariNet(nb_actions=4).to(device)
+
+# model.load_the_model(run_num) #weights_filename='models\model_iter_5000.pt'
+
+# agent = Agent(model=model,
+#               device=device,
+#               epsilon=1.0,
+#               nb_warmup=5000,
+#               nb_actions=4,
+#               learning_rate=0.0001,
+#               memory_capacity=100000,
+#               batch_size=32)
+
+# with tqdm(total=num_epochs, desc="Training Progress") as pbar:
+#     agent.train(env=env, epochs=num_epochs, progress_bar=pbar)
