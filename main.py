@@ -11,12 +11,15 @@ import torch.nn as nn
 import torch.nn.utils as torch_utils
 import torchvision.transforms as transforms
 import gymnasium as gym
+
 from collections import deque
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+
+ale = ALEI()
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"{device}")
