@@ -11,7 +11,8 @@ import torch.nn as nn
 import torch.nn.utils as torch_utils
 import torchvision.transforms as transforms
 import gymnasium as gym
-
+from ale_py import ALEInterface
+ale = ALEInterface()
 from collections import deque
 from PIL import Image
 import numpy as np
